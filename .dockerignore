@@ -1,0 +1,12 @@
+frontend/
+.git/
+.github/
+__pycache__/
+*.pyc
+.env
+.venv/
+notebooks/
+tests/
+models/*.pt
+models/*.pth
+README.md
