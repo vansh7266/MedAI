@@ -3,18 +3,57 @@
 import json
 import os
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from dotenv import load_dotenv
-from google.cloud import aiplatform
 from jinja2 import Template
-from langchain.agents import AgentExecutor, create_react_agent, tool
-from langchain.memory import ConversationBufferWindowMemory
-from langchain.prompts import PromptTemplate
-from langchain_google_vertexai import ChatVertexAI
 
 from src.model import get_model_and_tokenizer
-from src.rag_pipeline import MedicalRAG
+
+try:
+    from src.rag_pipeline import MedicalRAG
+except ImportError:
+    MedicalRAG = None
+
+try:
+    from langchain.agents import AgentExecutor, create_react_agent, tool
+    from langchain.memory import ConversationBufferWindowMemory
+    from langchain.prompts import PromptTemplate
+    from langchain_google_vertexai import ChatVertexAI
+except ImportError:
+    AgentExecutor = object
+    create_react_agent = None
+    ConversationBufferWindowMemory = None
+    PromptTemplate = None
+    ChatVertexAI = None
+
+    class LocalTool:
+        """Minimal callable tool wrapper used when LangChain imports are unavailable."""
+
+        def __init__(self, function: Callable[..., str]) -> None:
+            """Store the wrapped function and expose LangChain-like metadata."""
+            self.function = function
+            self.name = function.__name__
+            self.description = function.__doc__ or ""
+
+        def __call__(self, *args: Any, **kwargs: Any) -> str:
+            """Call the wrapped function directly."""
+            return self.function(*args, **kwargs)
+
+        def invoke(self, tool_input: Any) -> str:
+            """Call the wrapped function through a LangChain-like invoke method."""
+            if isinstance(tool_input, dict):
+                return self.function(**tool_input)
+            return self.function(tool_input)
+
+    def tool(function: Callable[..., str]) -> LocalTool:
+        """Wrap a function as a minimal local tool when LangChain is not importable."""
+        return LocalTool(function)
+
+try:
+    from google.cloud import aiplatform
+except ImportError:
+    aiplatform = None
 
 
 DEFAULT_VERTEX_MODEL = "gemini-2.5-flash-lite-preview-06-17"
@@ -42,6 +81,8 @@ def _load_rag() -> Optional[MedicalRAG]:
     """Load and cache the medical knowledge FAISS index when it exists."""
     if RAG_CACHE["rag"] is not None:
         return RAG_CACHE["rag"]
+    if MedicalRAG is None:
+        return None
 
     index_path = "data/medical_kb/medical.index"
     chunks_path = "data/medical_kb/chunks.pkl"
@@ -140,6 +181,19 @@ def get_agent() -> AgentExecutor:
     if not project_id:
         print("Warning: GOOGLE_CLOUD_PROJECT_ID is not set. Agent will use fallback pipeline.")
         raise RuntimeError("GOOGLE_CLOUD_PROJECT_ID is required for Vertex AI agent execution")
+
+    if (
+        create_react_agent is None
+        or ConversationBufferWindowMemory is None
+        or PromptTemplate is None
+        or ChatVertexAI is None
+    ):
+        print("Warning: LangChain Vertex AI agent dependencies are unavailable. Agent will use fallback pipeline.")
+        raise RuntimeError("LangChain Vertex AI agent dependencies are required for agent execution")
+
+    if aiplatform is None:
+        print("Warning: google-cloud-aiplatform is not installed. Agent will use fallback pipeline.")
+        raise RuntimeError("google-cloud-aiplatform is required for Vertex AI agent execution")
 
     try:
         aiplatform.init(project=project_id, location=location)

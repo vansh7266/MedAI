@@ -14,11 +14,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from pypdf import PdfReader
 
 from src.agent import get_agent, run_agent_query
 from src.model import MedicalReportModel, get_model_and_tokenizer
-from src.rag_pipeline import MedicalRAG, build_and_save_kb
+from src.utils import extract_text_from_pdf, generate_explanation
+
+try:
+    from src.rag_pipeline import MedicalRAG, build_and_save_kb
+except ImportError:
+    MedicalRAG = None
+    build_and_save_kb = None
 
 
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
@@ -103,6 +108,10 @@ class ModelManager:
             return
         index_path = "data/medical_kb/medical.index"
         chunks_path = "data/medical_kb/chunks.pkl"
+        if MedicalRAG is None:
+            print("Warning: FAISS RAG dependencies are not installed. Retrieval is disabled.")
+            self.rag_loaded = False
+            return
         if not os.path.exists(index_path) or not os.path.exists(chunks_path):
             print("Warning: Medical knowledge index not found. Run /build-index to create it.")
             self.rag_loaded = False
@@ -169,17 +178,11 @@ async def startup_event() -> None:
 
 def build_explanation(prediction: Dict) -> str:
     """Create a concise patient-friendly explanation from prediction output."""
-    entities = prediction.get("entities", [])
-    risk_level = prediction.get("risk_level", "UNKNOWN")
-    if entities:
-        entity_list = ", ".join(
-            f"{entity.get('text', '')} ({entity.get('type', '')})"
-            for entity in entities
-            if entity.get("text")
-        )
-    else:
-        entity_list = "no key medical entities were detected"
-    return f"Your report shows {risk_level} risk. Key findings: {entity_list}."
+    return generate_explanation(
+        prediction.get("entities", []),
+        str(prediction.get("risk_level", "UNKNOWN")),
+        prediction.get("risk_probs", {}),
+    )
 
 
 def analyze_report_text(text: str) -> AnalyzeResponse:
@@ -205,20 +208,11 @@ def analyze_report_text(text: str) -> AnalyzeResponse:
     )
 
 
-def extract_pdf_text(file_path: str) -> str:
-    """Extract and normalize text from a saved PDF file."""
-    reader = PdfReader(file_path)
-    page_texts = []
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        stripped = text.strip()
-        if stripped:
-            page_texts.append(stripped)
-    return "\n\n".join(page_texts).strip()
-
-
 def rebuild_index_task() -> None:
     """Rebuild the medical knowledge base index and refresh the cached RAG object."""
+    if build_and_save_kb is None or MedicalRAG is None:
+        print("Warning: Cannot rebuild knowledge base because FAISS RAG dependencies are unavailable.")
+        return
     build_and_save_kb("data/medical_kb/")
     model_manager.rag = MedicalRAG(
         index_path="data/medical_kb/medical.index",
@@ -248,7 +242,7 @@ async def analyze_pdf(file: UploadFile = File(...)) -> AnalyzeResponse:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
             temp_file.write(contents)
             temp_path = temp_file.name
-        extracted_text = extract_pdf_text(temp_path)
+        extracted_text = extract_text_from_pdf(temp_path)
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
@@ -287,7 +281,7 @@ async def health() -> HealthResponse:
     """Return current service health and component readiness."""
     ready = model_manager.is_ready()
     return HealthResponse(
-        status="ok" if ready else "degraded",
+        status="healthy" if ready else "degraded",
         model_loaded=ready,
         index_loaded=model_manager.rag is not None,
     )
